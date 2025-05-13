@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>SPF Record Checker</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <style>
+        .filter-bar { margin: 1rem 0; display: flex; gap: 1rem; align-items: center; }
+        .filter-bar button { padding: 0.4rem 1rem; border-radius: 4px; border: 1px solid #007bff; background: #f7fafd; color: #007bff; font-weight: 600; cursor: pointer; }
+        .filter-bar button.active, .filter-bar button:focus { background: #007bff; color: #fff; }
+        #searchInput { padding: 0.5rem; border-radius: 4px; border: 1px solid #b5c2d6; font-size: 1rem; flex: 1; }
+        th.sortable { cursor: pointer; }
+        th.sorted-asc::after { content: " ▲"; }
+        th.sorted-desc::after { content: " ▼"; }
+        .pagination { margin: 1.5rem 0; display: flex; gap: 0.5rem; justify-content: center; align-items: center; }
+        .pagination button { padding: 0.4rem 0.8rem; cursor: pointer; }
+        .pagination button.active-page { background: #007bff; color: white; }
+        .copy-btn { margin-top: 1rem; padding: 0.5rem 1rem; background: #28a745; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        .copy-btn:hover { background: #218838; }
+        .selected-row { background-color: #e3f0ff !important; }
+        .action-bar { display: flex; justify-content: space-between; margin-top: 1rem; }
+        .checkbox-col { width: 30px; text-align: center; }
+        #selectAllCheckbox { margin: 0; }
+        #copyFeedback { color: #28a745; margin-left: 1rem; display: none; }
+    </style>
+</head>
+<body>
+<main>
+    <h1>SPF Record Checker</h1>
+    <section class="input-section">
+        <form id="spfForm" autocomplete="off" aria-label="SPF Record Checker Form">
+            <label for="domains">Enter domains (one per line):</label>
+            <textarea id="domains" name="domains" rows="8" aria-required="true" required></textarea>
+            <div id="domainError" class="error" role="alert" aria-live="assertive"></div>
+            <button type="submit" id="submitBtn">Check SPF Records</button>
+        </form>
+    </section>
+    <section class="filter-bar">
+        <input type="text" id="searchInput" placeholder="Search domain or SPF..." aria-label="Search SPF results">
+        <button type="button" id="filterNoSPF">No SPF</button>
+        <button type="button" id="filterError">SPF Error</button>
+        <button type="button" id="clearFilters">Clear Filters</button>
+    </section>
+    <section class="results-per-page">
+        <label for="perPageSelect">Results per page:</label>
+        <select id="perPageSelect">
+            <option value="100">100</option>
+            <option value="500">500</option>
+            <option value="1000">1000</option>
+        </select>
+    </section>
+    <section id="loadingMsg" class="loading" style="display:none;">Processing... (This may take a while)</section>
+    <section>
+        <table id="resultsTable" aria-label="SPF Results Table">
+            <thead>
+                <tr>
+                    <th class="checkbox-col"><input type="checkbox" id="selectAllCheckbox" aria-label="Select all rows"></th>
+                    <th>Domain</th>
+                    <th>SPF Found</th>
+                    <th class="sortable" id="spfSortHeader">SPF Record</th>
+                    <th>Error</th>
+                </tr>
+            </thead>
+            <tbody></tbody>
+        </table>
+        <div class="pagination" id="pagination"></div>
+        <div class="action-bar">
+            <button id="copySelectedBtn" class="copy-btn">Copy Selected Domains</button>
+            <span id="copyFeedback">Copied to clipboard!</span>
+        </div>
+    </section>
+</main>
+<script>
+    // --- Data and State ---
+    let allResults = [];
+    let filteredResults = [];
+    let currentPage = 1;
+    let perPage = 100;
+    let sortAsc = true;
+    let filterMode = null; // "noSPF", "error", or null
+    let selectedRows = new Set(); // Track selected row indices
+
+    // --- DOM Elements ---
+    const form = document.getElementById('spfForm');
+    const domainsInput = document.getElementById('domains');
+    const domainError = document.getElementById('domainError');
+    const loadingMsg = document.getElementById('loadingMsg');
+    const resultsTable = document.getElementById('resultsTable');
+    const resultsBody = resultsTable.querySelector('tbody');
+    const paginationDiv = document.getElementById('pagination');
+    const perPageSelect = document.getElementById('perPageSelect');
+    const copySelectedBtn = document.getElementById('copySelectedBtn');
+    const selectAllCheckbox = document.getElementById('selectAllCheckbox');
+    const copyFeedback = document.getElementById('copyFeedback');
+
+    // --- Utility Functions ---
+    function isValidDomain(domain) {
+        return /^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(domain.trim());
+    }
+
+    function paginate(results, page, perPage) {
+        const start = (page - 1) * perPage;
+        return results.slice(start, start + perPage);
+    }
+
+    function renderTable(results) {
+        resultsBody.innerHTML = '';
+        
+        // Get the current page of results
+        const pageResults = paginate(results, currentPage, perPage);
+        
+        // Calculate the starting index for this page
+        const startIndex = (currentPage - 1) * perPage;
+        
+        pageResults.forEach((r, localIndex) => {
+            const globalIndex = startIndex + localIndex;
+            const isSelected = selectedRows.has(globalIndex);
+            
+            const tr = document.createElement('tr');
+            if (isSelected) {
+                tr.classList.add('selected-row');
+            }
+            
+            tr.innerHTML = `
+                <td class="checkbox-col">
+                    <input type="checkbox" class="row-checkbox" data-index="${globalIndex}" 
+                           ${isSelected ? 'checked' : ''} aria-label="Select row">
+                </td>
+                <td>${r.domain}</td>
+                <td>${r.has_spf ? 'Yes' : 'No'}</td>
+                <td>${r.spf_record ? r.spf_record : ''}</td>
+                <td>${r.error ? r.error : ''}</td>
+            `;
+            resultsBody.appendChild(tr);
+        });
+        
+        // Add event listeners to checkboxes
+        document.querySelectorAll('.row-checkbox').forEach(checkbox => {
+            checkbox.addEventListener('change', function() {
+                const index = parseInt(this.dataset.index);
+                if (this.checked) {
+                    selectedRows.add(index);
+                    this.closest('tr').classList.add('selected-row');
+                } else {
+                    selectedRows.delete(index);
+                    this.closest('tr').classList.remove('selected-row');
+                }
+                
+                // Update "select all" checkbox
+                updateSelectAllCheckbox();
+            });
+        });
+        
+        // Update "select all" checkbox state
+        updateSelectAllCheckbox();
+    }
+    
+    function updateSelectAllCheckbox() {
+        const checkboxes = document.querySelectorAll('.row-checkbox');
+        const allChecked = checkboxes.length > 0 && Array.from(checkboxes).every(cb => cb.checked);
+        selectAllCheckbox.checked = allChecked;
+    }
+
+    function renderPagination(total, page, perPage) {
+        paginationDiv.innerHTML = '';
+        const pages = Math.ceil(total / perPage);
+        
+        if (pages <= 1) return;
+        
+        // Previous button
+        const prevBtn = document.createElement('button');
+        prevBtn.textContent = '« Prev';
+        prevBtn.disabled = page === 1;
+        prevBtn.onclick = () => {
+            if (currentPage > 1) {
+                currentPage--;
+                updateDisplay();
+            }
+        };
+        paginationDiv.appendChild(prevBtn);
+        
+        // Page numbers
+        const maxButtons = 5;
+        let startPage = Math.max(1, page - Math.floor(maxButtons / 2));
+        let endPage = Math.min(pages, startPage + maxButtons - 1);
+        
+        if (endPage - startPage + 1 < maxButtons) {
+            startPage = Math.max(1, endPage - maxButtons + 1);
+        }
+        
+        for (let i = startPage; i <= endPage; i++) {
+            const btn = document.createElement('button');
+            btn.textContent = i;
+            btn.className = (i === page) ? 'active-page' : '';
+            btn.onclick = () => {
+                currentPage = i;
+                updateDisplay();
+            };
+            paginationDiv.appendChild(btn);
+        }
+        
+        // Next button
+        const nextBtn = document.createElement('button');
+        nextBtn.textContent = 'Next »';
+        nextBtn.disabled = page === pages;
+        nextBtn.onclick = () => {
+            if (currentPage < pages) {
+                currentPage++;
+                updateDisplay();
+            }
+        };
+        paginationDiv.appendChild(nextBtn);
+        
+        // Page info
+        const pageInfo = document.createElement('span');
+        pageInfo.textContent = `Page ${page} of ${pages}`;
+        pageInfo.style.marginLeft = '10px';
+        paginationDiv.appendChild(pageInfo);
+    }
+
+    function applyAllFilters() {
+        let results = [...allResults];
+        
+        // Filter by No SPF or Error
+        if (filterMode === 'noSPF') {
+            results = results.filter(r => !r.has_spf && !r.error);
+        } else if (filterMode === 'error') {
+            results = results.filter(r => r.error);
+        }
+        
+        // Search filter
+        const searchVal = document.getElementById('searchInput').value.trim().toLowerCase();
+        if (searchVal) {
+            results = results.filter(r =>
+                r.domain.toLowerCase().includes(searchVal) ||
+                (r.spf_record && r.spf_record.toLowerCase().includes(searchVal))
+            );
+        }
+        
+        // Sorting
+        if (document.getElementById('spfSortHeader').classList.contains('sorted-asc')) {
+            results.sort((a, b) => (a.spf_record || '').localeCompare(b.spf_record || ''));
+        } else if (document.getElementById('spfSortHeader').classList.contains('sorted-desc')) {
+            results.sort((a, b) => (b.spf_record || '').localeCompare(a.spf_record || ''));
+        }
+        
+        filteredResults = results;
+        currentPage = 1;
+        updateDisplay();
+    }
+    
+    function updateDisplay() {
+        renderTable(filteredResults);
+        renderPagination(filteredResults.length, currentPage, perPage);
+    }
+    
+    function copySelectedToClipboard() {
+        // Array to hold only the domain names
+        const selectedDomains = [];
+        
+        // Add selected domains
+        filteredResults.forEach((result, index) => {
+            if (selectedRows.has(index)) {
+                selectedDomains.push(result.domain);
+            }
+        });
+        
+        // If no rows selected, show message
+        if (selectedDomains.length === 0) {
+            alert('Please select at least one row to copy');
+            return;
+        }
+        
+        // Convert to text with one domain per line
+        const text = selectedDomains.join('\n');
+        
+        // Copy to clipboard
+        navigator.clipboard.writeText(text)
+            .then(() => {
+                // Show feedback
+                copyFeedback.style.display = 'inline';
+                setTimeout(() => {
+                    copyFeedback.style.display = 'none';
+                }, 2000);
+            })
+            .catch(err => {
+                console.error('Failed to copy: ', err);
+                alert('Failed to copy to clipboard. Please try again.');
+            });
+    }
+
+    // --- Event Handlers ---
+    form.addEventListener('submit', function(e) {
+        e.preventDefault();
+        domainError.textContent = '';
+        let domains = domainsInput.value.split('\n').map(d => d.trim()).filter(d => d);
+        let invalids = domains.filter(d => !isValidDomain(d));
+        
+        if (invalids.length > 0) {
+            domainError.textContent = 'Invalid domain(s): ' + invalids.join(', ');
+            return;
+        }
+        
+        loadingMsg.style.display = '';
+        fetch('/check', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({domains})
+        })
+        .then(res => res.json())
+        .then(data => {
+            allResults = data;
+            filterMode = null;
+            document.getElementById('filterNoSPF').classList.remove('active');
+            document.getElementById('filterError').classList.remove('active');
+            document.getElementById('spfSortHeader').classList.remove('sorted-asc', 'sorted-desc');
+            document.getElementById('searchInput').value = '';
+            filteredResults = [...allResults];
+            selectedRows.clear(); // Clear selected rows
+            currentPage = 1;
+            updateDisplay();
+        })
+        .catch(() => {
+            domainError.textContent = 'An error occurred. Please try again.';
+        })
+        .finally(() => {
+            loadingMsg.style.display = 'none';
+        });
+    });
+
+    document.getElementById('filterNoSPF').addEventListener('click', function() {
+        filterMode = filterMode === 'noSPF' ? null : 'noSPF';
+        this.classList.toggle('active');
+        document.getElementById('filterError').classList.remove('active');
+        applyAllFilters();
+    });
+    
+    document.getElementById('filterError').addEventListener('click', function() {
+        filterMode = filterMode === 'error' ? null : 'error';
+        this.classList.toggle('active');
+        document.getElementById('filterNoSPF').classList.remove('active');
+        applyAllFilters();
+    });
+    
+    document.getElementById('clearFilters').addEventListener('click', function() {
+        filterMode = null;
+        document.getElementById('filterNoSPF').classList.remove('active');
+        document.getElementById('filterError').classList.remove('active');
+        document.getElementById('searchInput').value = '';
+        document.getElementById('spfSortHeader').classList.remove('sorted-asc', 'sorted-desc');
+        applyAllFilters();
+    });
+    
+    document.getElementById('searchInput').addEventListener('input', function() {
+        applyAllFilters();
+    });
+
+    // Sorting SPF Record column
+    document.getElementById('spfSortHeader').addEventListener('click', function() {
+        if (this.classList.contains('sorted-asc')) {
+            this.classList.remove('sorted-asc');
+            this.classList.add('sorted-desc');
+        } else if (this.classList.contains('sorted-desc')) {
+            this.classList.remove('sorted-desc');
+        } else {
+            this.classList.add('sorted-asc');
+        }
+        applyAllFilters();
+    });
+    
+    // Per Page select
+    perPageSelect.addEventListener('change', function() {
+        perPage = parseInt(this.value);
+        currentPage = 1;
+        updateDisplay();
+    });
+    
+    // Select All checkbox
+    selectAllCheckbox.addEventListener('change', function() {
+        const checkboxes = document.querySelectorAll('.row-checkbox');
+        const startIndex = (currentPage - 1) * perPage;
+        
+        checkboxes.forEach((checkbox, localIndex) => {
+            const globalIndex = startIndex + localIndex;
+            checkbox.checked = this.checked;
+            
+            if (this.checked) {
+                selectedRows.add(globalIndex);
+                checkbox.closest('tr').classList.add('selected-row');
+            } else {
+                selectedRows.delete(globalIndex);
+                checkbox.closest('tr').classList.remove('selected-row');
+            }
+        });
+    });
+    
+    // Copy Selected button
+    copySelectedBtn.addEventListener('click', copySelectedToClipboard);
+</script>
+</body>
+</html>
